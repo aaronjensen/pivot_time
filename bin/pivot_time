@@ -1,0 +1,170 @@
+#!/usr/bin/env ruby
+
+require 'active_support'
+require 'business_time'
+require 'yaml'
+
+def request(&block)
+  raw_response = block.call
+  response = Hash.from_xml(raw_response)
+
+  response
+end
+
+def cache_in_file(path, &block)
+  if File.exists? path
+    YAML.load_file(path)
+  else
+    block.call.tap do |value|
+      File.write path, YAML.dump(value)
+    end
+  end
+end
+
+def api(method, path)
+  cache_in_file("data/#{method}-#{path.gsub(%r([/?&]), '_')}") do
+    request do
+      `curl -H "X-TrackerToken: #{TOKEN}" -X #{method} http://www.pivotaltracker.com/services/v4/#{path}`
+    end
+  end
+end
+
+api_stories = api("GET", "projects/#{PROJECT_ID}/stories")["stories"]
+
+
+class Story
+  attr_reader :id, :accepted_at, :story_state, :type, :points
+
+  def initialize(data)
+    @id = data["id"]
+    @accepted_at = Time.parse(data["accepted_at"].to_s)
+    @activities = Activities.for_story(id)
+    @type = data["story_type"]
+    @points = data["estimate"].to_i
+    build_story_state
+  end
+
+  def activity_count
+    @activities.count
+  end
+
+  def build_story_state
+    @story_state = StoryState.new
+    @activities.updates.each do |update|
+      next unless update.state_change
+      @story_state.update(update.state_change, update.occurred_at)
+    end
+  end
+
+  def time_spent
+    return unless started_at && accepted_at
+    started_at.business_time_until(accepted_at) / 1.hour
+  end
+
+  delegate :accepted_at, :started_at, to: :story_state
+end
+
+class Activity
+  attr_reader :occurred_at, :state_change
+  def initialize(data)
+    @occurred_at = Time.parse(data["occurred_at"].to_s)
+    @state_change = data["stories"].first["current_state"]
+  end
+end
+
+class Activities
+  def initialize(data)
+    @data = data
+  end
+
+  def count
+    updates.count
+  end
+
+  def self.for_story(id)
+    new(api("GET", "stories/#{id}/activities?limit=100")["activities"])
+  end
+
+  def updates
+    @data.select { |activity| activity["event_type"] == "story_update" }
+      .sort_by {|activity| activity["id"].to_i}
+      .map {|activity| Activity.new(activity)}
+  end
+end
+
+class StoryState
+  attr_reader :rejection_count, :accepted_at, :first_delivered_at,
+    :delivered_at, :started_at, :scheduled_at, :state
+  def initialize
+    @rejection_count = 0
+    @state = "unscheduled"
+  end
+
+  def update(state, date)
+    return if self.state == state
+
+    send state, date
+  end
+
+  def accepted(date)
+    @accepted_at ||= date
+  end
+
+  def delivered(date)
+    @accepted_at = nil
+    @first_delivered_at ||= date
+    @last_delivered_at = date
+  end
+
+  def finished(date)
+    @accepted_at = nil
+  end
+
+  def rejected(date)
+    @rejection_count += 1
+  end
+
+  def started(date)
+    @started_at ||= date
+  end
+
+  def unscheduled(date)
+    unstarted(date)
+    @scheduled_at = nil
+  end
+
+  def unstarted(date)
+    @started_at = nil
+    @first_delivered_at = nil
+    @last_delivered_at = nil
+
+    @scheduled_at ||= date
+  end
+end
+
+stories = []
+
+recently = Time.new(2013, 5, 1)
+
+api_stories.each do |data|
+  next unless data["current_state"] == "accepted"
+  next unless data["accepted_at"] > recently
+
+  story = Story.new(data)
+  next unless story.time_spent
+
+  stories << story
+  puts "#{story.id}: #{story.type} #{story.points} #{story.time_spent.round}"
+end
+
+require 'csv'
+
+out = CSV.generate do |csv|
+  csv << %w[id started_at accepted_at type points time_spent]
+
+  stories.each do |story|
+    csv << [story.id, story.started_at, story.accepted_at, story.type, story.points, story.time_spent]
+  end
+end
+
+File.write("out.csv", out)
